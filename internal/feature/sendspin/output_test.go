@@ -177,16 +177,29 @@ func ramp(n int) []int16 {
 	return s
 }
 
+// heard is the write position at which the anchor frame is the one being heard: the tail further on.
+const heard = 1000 + uint64(tailFrames)
+
+// listening anchors a room and queues a ramp at the anchor, then puts the card where that frame is
+// being heard, so that only the server clock decides what the correction sees.
+func listening(t *testing.T) *out {
+	t.Helper()
+	o := anchored(t)
+	// Audio from the anchor to well past the write position, as a running stream has.
+	o.write(microsFor(0), ramp(int(tailFrames)+4800))
+	o.played = heard
+	return o
+}
+
 // A room whose speaker runs fast finds itself rendering frames the server clock has not reached yet.
 // The renderer should repeat frames until the two agree, moving the anchor with them.
 func TestDriftCorrectionRepeatsFramesWhenEarly(t *testing.T) {
-	o := anchored(t)
-	o.write(microsFor(0), ramp(4800))
+	o := listening(t)
 
-	// The server clock says frame 900 is due; the card is at 1000: a hundred frames early.
+	// The server clock says frame 900 is due where the card is hearing 1000: a hundred frames early.
 	o.serverNow = func() int64 { return microsFor(-100) }
 	for range 400 {
-		o.Render(1000, frames(1))
+		o.Render(heard, frames(1))
 	}
 
 	if o.corrected < 60 || o.corrected > 100 {
@@ -198,24 +211,24 @@ func TestDriftCorrectionRepeatsFramesWhenEarly(t *testing.T) {
 	if got := len(o.pcm) / speaker.Channels; got != 4800+int(o.corrected) {
 		t.Fatalf("queue holds %d frames, want %d", got, 4800+int(o.corrected))
 	}
-	// Everything repeated is the first frame; the original run follows intact.
+	// Everything repeated is the frame at the head; the original run follows intact.
+	first := int16(heard - 1000)
 	for i := range int(o.corrected) + 1 {
-		if o.pcm[i*speaker.Channels] != 0 {
-			t.Fatalf("frame %d is %d, want a repeat of frame 0", i, o.pcm[i*speaker.Channels])
+		if o.pcm[i*speaker.Channels] != first {
+			t.Fatalf("frame %d is %d, want a repeat of frame %d", i, o.pcm[i*speaker.Channels], first)
 		}
 	}
-	if o.pcm[(int(o.corrected)+1)*speaker.Channels] != 1 {
-		t.Fatal("the original second frame did not follow the repeats")
+	if o.pcm[(int(o.corrected)+1)*speaker.Channels] != first+1 {
+		t.Fatal("the original next frame did not follow the repeats")
 	}
 }
 
 func TestDriftCorrectionSkipsFramesWhenLate(t *testing.T) {
-	o := anchored(t)
-	o.write(microsFor(0), ramp(4800))
+	o := listening(t)
 
 	o.serverNow = func() int64 { return microsFor(100) }
 	for range 400 {
-		o.Render(1000, frames(1))
+		o.Render(heard, frames(1))
 	}
 
 	if o.corrected > -60 || o.corrected < -100 {
@@ -224,18 +237,36 @@ func TestDriftCorrectionSkipsFramesWhenLate(t *testing.T) {
 	if int64(o.frame) != 1000+o.corrected {
 		t.Fatalf("anchor frame %d did not move with the %d frames skipped", o.frame, -o.corrected)
 	}
-	if o.pcm[0] != int16(-o.corrected) {
-		t.Fatalf("queue head is frame %d, want %d", o.pcm[0], -o.corrected)
+	if want := int16(heard-1000) + int16(-o.corrected); o.pcm[0] != want {
+		t.Fatalf("queue head is frame %d, want %d", o.pcm[0], want)
+	}
+}
+
+// A large error at the start of a stream is a misplaced anchor, and is put right in one step of
+// silence rather than a frame at a time.
+func TestDriftCorrectionSnapsLargeErrors(t *testing.T) {
+	o := listening(t)
+	o.serverNow = func() int64 { return microsFor(-2400) }
+	for range 800 {
+		o.Render(heard, frames(1))
+	}
+	if o.corrected < 2350 || o.corrected > 2450 {
+		t.Fatalf("corrected %d frames, want about 2400", o.corrected)
+	}
+	if o.pcm[0] != 0 || o.pcm[100*speaker.Channels] != 0 {
+		t.Fatal("the snap did not insert silence at the head")
+	}
+	if int64(o.frame) != 1000+o.corrected {
+		t.Fatalf("anchor frame %d did not move with the %d frames inserted", o.frame, o.corrected)
 	}
 }
 
 // Inside the band nothing moves: correcting jitter would be worse than the jitter.
 func TestDriftCorrectionLeavesSmallErrorsAlone(t *testing.T) {
-	o := anchored(t)
-	o.write(microsFor(0), ramp(4800))
+	o := listening(t)
 	o.serverNow = func() int64 { return microsFor(-10) }
 	for range 400 {
-		o.Render(1000, frames(1))
+		o.Render(heard, frames(1))
 	}
 	if o.corrected != 0 || o.frame != 1000 {
 		t.Fatalf("corrected %d, frame %d", o.corrected, o.frame)

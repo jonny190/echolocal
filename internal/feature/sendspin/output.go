@@ -34,9 +34,19 @@ const holdMax = 60 * speaker.Rate
 // driftGain is the smoothing: at 47 periods a second, a time constant of about a second, enough to
 // take the scheduling jitter out of when a period happens to be rendered. driftBand is half a
 // millisecond either side, inside the spec's 1 ms floor with room for the noise that remains.
+//
+// An error past snapBand is not drift but a misplaced anchor, most often a period's worth of phase
+// between the write counter and the card at the moment the stream started, or an underrun that moved
+// the counter on without playing anything. That is put right in one step of silence or one skip, which
+// the spec allows on a start, and the fine correction takes it from there.
+//
+// tailFrames is the hardware tail in frames: the write counter is that far ahead of what is heard, and
+// the anchor was laid in terms of what is heard.
 const (
-	driftGain = 0.02
-	driftBand = speaker.Rate / 2000
+	driftGain  = 0.02
+	driftBand  = speaker.Rate / 2000
+	snapBand   = speaker.Rate / 100
+	tailFrames = int64(speaker.HardwareTail * speaker.Rate / time.Second)
 )
 
 // out places this room's audio by output frame index. Arrival order cannot line two rooms up: a burst
@@ -232,11 +242,26 @@ func (o *out) correct(from uint64) {
 		return
 	}
 
-	// The frame the server clock says should be rendering now, against the one that is.
+	// The frame the server clock says should be heard now, against the one that is: the frame being
+	// rendered less the tail it has yet to travel.
 	want := int64(o.frame) + (o.serverNow()-o.at)*speaker.Rate/1e6
-	o.drift += (float64(int64(from)-want) - o.drift) * driftGain
+	o.drift += (float64(int64(from)-tailFrames-want) - o.drift) * driftGain
 
 	switch {
+	case o.drift > snapBand:
+		n := int(o.drift)
+		o.pcm = append(make([]int16, n*speaker.Channels), o.pcm...)
+		o.frame += uint64(n)
+		o.corrected += int64(n)
+		o.drift = 0
+		slog.Info("sendspin snapped later", "ms", n*1000/speaker.Rate)
+	case o.drift < -snapBand:
+		n := min(int(-o.drift), len(o.pcm)/speaker.Channels-1)
+		o.pcm = append(o.pcm[:0], o.pcm[n*speaker.Channels:]...)
+		o.frame -= uint64(n)
+		o.corrected -= int64(n)
+		o.drift = 0
+		slog.Info("sendspin snapped earlier", "ms", n*1000/speaker.Rate)
 	case o.drift > driftBand:
 		// Early: say the first frame twice, and move the anchor with it so what arrives next lands in
 		// step with what is already queued.
