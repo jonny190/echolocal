@@ -156,9 +156,29 @@ best round to the filter. What changed is when it runs and what it gates. It sta
 activate and pauses across a re-handshake. The room does not report itself `available` until the
 filter has converged, as the spec requires, and its `client/state` always carries the full player
 object: volume, mute, the delay under both the spec's name and the one Music Assistant still reads,
-and the lead time and buffer the room asks for. The commands the room accepts are said in the hello
-only: Music Assistant's library rejects a state that names volume or mute and drops the connection,
-which is how the first install against a real Music Assistant 2.11 failed.
+the lead time and buffer the room asks for, and `set_static_delay` as the one command named there.
+Volume and mute are said in the hello only: Music Assistant's library rejects a state that names them
+and drops the connection, which is how the first install against a real Music Assistant 2.11 failed.
+
+## Holding sync
+
+The renderer in `output.go` places audio by server timestamp: each stream is anchored once, mapping a
+server time to an output frame, and every chunk lands at the frame its timestamp maps to. That alone
+does not keep two rooms together, because each Dot's audio clock runs at its own rate. Measured on two
+Dots, one ran about 200 ppm fast and pulled ahead of the other by 12 ms a minute.
+
+So every render period the frame being rendered is compared with the frame the server clock says
+should be, the error is smoothed with a time constant of about a second, and while the smoothed error
+is outside half a millisecond one frame is repeated (early) or skipped (late), with the anchor moved
+by the same frame so what arrives next lands in step with what is already queued. This is the spec's
+suggested strategy. The `sendspin ahead` log line reports the smoothed drift and the running count of
+corrected frames.
+
+On top of that, the room accepts the `set_static_delay` command (and the spec's newer name,
+`set_output_delay`). Naming it in `client/state` is what makes Music Assistant show a per-player delay
+setting for the room. The value is kept in the settings file, reported back in every state, and taken
+off each chunk's timestamp so the room plays that much earlier. It is the knob for whatever constant
+offset remains between rooms, set by ear from Music Assistant.
 
 ## Home Assistant entities
 

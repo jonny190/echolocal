@@ -51,8 +51,20 @@ const bufferCapacity = bufferSeconds * speaker.Rate * speaker.Channels * speaker
 // pairTimeout bounds a pairing attempt from its first message, as the spec recommends.
 const pairTimeout = 2 * time.Minute
 
-// commands is what the server may set on this player.
-var commands = []string{"volume", "mute"}
+// commands is what the server may set on this player, as said in the hello. stateCommands is the one
+// said in client/state as well (see playerState). The delay is how an operator lines rooms up by ear.
+var (
+	commands      = []string{"volume", "mute"}
+	stateCommands = []string{cmdSetStaticDelay}
+)
+
+const (
+	cmdSetStaticDelay = "set_static_delay"
+	cmdSetOutputDelay = "set_output_delay"
+
+	// maxDelayMs is the spec's ceiling on the delay.
+	maxDelayMs = 5000
+)
 
 // What the security sensor says about the connection.
 const (
@@ -147,7 +159,7 @@ func (s *session) run(ctx context.Context) error {
 	s.settled(res)
 	slog.Info("sendspin channel up", "server", short(s.c.serverID), "key", res.category, "fell_back", res.fellBack)
 
-	s.out.use(s.clock)
+	s.out.use(s.clock, config.Get().Sendspin.OutputDelayMs)
 	safe.Go("sendspin clock", func() { s.syncLoop(ctx) })
 
 	// Leaving is a word and then the socket: the word so the server knows whether to come back, the
@@ -623,11 +635,14 @@ func (s *session) heard(body []byte) {
 	// also how far behind the intended point the room is running.
 	if s.chunks++; s.chunks%250 == 0 {
 		late, dropped := s.out.misses()
+		driftFrames, corrected := s.out.drifting()
 		slog.Info("sendspin ahead",
 			"queued_ms", s.out.queuedMs(),
 			"lead_ms", (at-s.clock.ServerMicrosNow())/1000,
 			"late", late,
-			"dropped", dropped)
+			"dropped", dropped,
+			"drift_ms", fmt.Sprintf("%.2f", driftFrames*1000/speaker.Rate),
+			"corrected", corrected)
 	}
 }
 
@@ -642,6 +657,17 @@ func (s *session) told(cmd playerCommand) {
 			s.muted = *cmd.Mute
 			s.out.setMuted(*cmd.Mute)
 		}
+	case cmdSetStaticDelay, cmdSetOutputDelay:
+		ms, ok := cmd.delay()
+		if !ok {
+			return
+		}
+		ms = max(0, min(ms, maxDelayMs))
+		if err := config.Set().Sendspin().OutputDelayMs(ms); err != nil {
+			slog.Error("saving a setting failed", "setting", "sendspin output delay", "err", err)
+		}
+		s.out.setDelay(ms)
+		slog.Info("sendspin output delay", "ms", ms)
 	}
 	s.reportState()
 }
@@ -654,13 +680,17 @@ func (s *session) reportState() {
 	if !s.player() || !s.synced.Load() {
 		return
 	}
+	c := config.Get()
 	st := clientState{
 		Available: true,
 		Player: &playerState{
-			Volume:             config.Get().Speaker.Volume * 100 / speaker.VolumeSteps,
+			Volume:             c.Speaker.Volume * 100 / speaker.VolumeSteps,
 			Muted:              s.muted,
+			OutputDelayMs:      c.Sendspin.OutputDelayMs,
+			StaticDelayMs:      c.Sendspin.OutputDelayMs,
 			RequiredLeadTimeMs: requiredLeadMs,
 			MinBufferMs:        minBufferMs,
+			SupportedCommands:  stateCommands,
 		},
 	}
 	if err := s.c.writeJSON(typeClientState, st); err != nil {

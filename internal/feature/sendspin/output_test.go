@@ -167,3 +167,89 @@ func TestFlushDropsTheAnchor(t *testing.T) {
 		t.Errorf("held %d samples, want none", len(o.pcm))
 	}
 }
+
+// ramp is audio whose frames can be told apart, so a repeated or skipped one shows.
+func ramp(n int) []int16 {
+	s := frames(n)
+	for i := range s {
+		s[i] = int16(i / speaker.Channels)
+	}
+	return s
+}
+
+// A room whose speaker runs fast finds itself rendering frames the server clock has not reached yet.
+// The renderer should repeat frames until the two agree, moving the anchor with them.
+func TestDriftCorrectionRepeatsFramesWhenEarly(t *testing.T) {
+	o := anchored(t)
+	o.write(microsFor(0), ramp(4800))
+
+	// The server clock says frame 900 is due; the card is at 1000: a hundred frames early.
+	o.serverNow = func() int64 { return microsFor(-100) }
+	for range 400 {
+		o.Render(1000, frames(1))
+	}
+
+	if o.corrected < 60 || o.corrected > 100 {
+		t.Fatalf("corrected %d frames, want most of 100", o.corrected)
+	}
+	if int64(o.frame) != 1000+o.corrected {
+		t.Fatalf("anchor frame %d did not move with the %d frames repeated", o.frame, o.corrected)
+	}
+	if got := len(o.pcm) / speaker.Channels; got != 4800+int(o.corrected) {
+		t.Fatalf("queue holds %d frames, want %d", got, 4800+int(o.corrected))
+	}
+	// Everything repeated is the first frame; the original run follows intact.
+	for i := range int(o.corrected) + 1 {
+		if o.pcm[i*speaker.Channels] != 0 {
+			t.Fatalf("frame %d is %d, want a repeat of frame 0", i, o.pcm[i*speaker.Channels])
+		}
+	}
+	if o.pcm[(int(o.corrected)+1)*speaker.Channels] != 1 {
+		t.Fatal("the original second frame did not follow the repeats")
+	}
+}
+
+func TestDriftCorrectionSkipsFramesWhenLate(t *testing.T) {
+	o := anchored(t)
+	o.write(microsFor(0), ramp(4800))
+
+	o.serverNow = func() int64 { return microsFor(100) }
+	for range 400 {
+		o.Render(1000, frames(1))
+	}
+
+	if o.corrected > -60 || o.corrected < -100 {
+		t.Fatalf("corrected %d frames, want most of -100", o.corrected)
+	}
+	if int64(o.frame) != 1000+o.corrected {
+		t.Fatalf("anchor frame %d did not move with the %d frames skipped", o.frame, -o.corrected)
+	}
+	if o.pcm[0] != int16(-o.corrected) {
+		t.Fatalf("queue head is frame %d, want %d", o.pcm[0], -o.corrected)
+	}
+}
+
+// Inside the band nothing moves: correcting jitter would be worse than the jitter.
+func TestDriftCorrectionLeavesSmallErrorsAlone(t *testing.T) {
+	o := anchored(t)
+	o.write(microsFor(0), ramp(4800))
+	o.serverNow = func() int64 { return microsFor(-10) }
+	for range 400 {
+		o.Render(1000, frames(1))
+	}
+	if o.corrected != 0 || o.frame != 1000 {
+		t.Fatalf("corrected %d, frame %d", o.corrected, o.frame)
+	}
+}
+
+// The delay places audio earlier than its timestamp, which is how a room whose sound has further to
+// travel is lined up with the others.
+func TestDelayPlacesAudioEarlier(t *testing.T) {
+	o := anchored(t)
+	o.setDelay(10)
+	o.write(microsFor(4800), tone(48, 7))
+	// 10 ms is 480 frames at 48 kHz: the chunk due at frame 5800 lands at 5320.
+	if o.base != 5320 {
+		t.Fatalf("placed at frame %d, want 5320", o.base)
+	}
+}

@@ -24,6 +24,21 @@ import (
 // reaching this means a timestamp we cannot believe rather than a server sending too much.
 const holdMax = 60 * speaker.Rate
 
+// Drift correction. The anchor maps server time to output frames at the nominal rate, but the speaker's
+// clock is not the server's: measured on device, one Dot ran about 200 ppm fast and pulled ahead of
+// another by 12 ms a minute. So every render period the frame being rendered is compared with the frame
+// the server clock says should be, the error is smoothed, and one frame is dropped or repeated per
+// period while the smoothed error is outside the band. A frame is 21 us; the spec's own suggestion,
+// and inaudible at the handful per second a real drift needs.
+//
+// driftGain is the smoothing: at 47 periods a second, a time constant of about a second, enough to
+// take the scheduling jitter out of when a period happens to be rendered. driftBand is half a
+// millisecond either side, inside the spec's 1 ms floor with room for the noise that remains.
+const (
+	driftGain = 0.02
+	driftBand = speaker.Rate / 2000
+)
+
 // out places this room's audio by output frame index. Arrival order cannot line two rooms up: a burst
 // of jitter on one of them shifts it against the other for good, because nothing says where the audio
 // was meant to go. The server's timestamps say, so they decide.
@@ -43,10 +58,24 @@ type out struct {
 	pcm    []int16
 
 	// The frame that carries server time at. Fixed once per stream: recomputing it per chunk would
-	// feed the sampling jitter of "what is playing now" straight back into where audio lands.
+	// feed the sampling jitter of "what is playing now" straight back into where audio lands. Drift
+	// correction nudges frame by whole frames instead, in step with the audio it moves.
 	anchored bool
 	frame    uint64
 	at       int64
+
+	// delay is how much earlier than its timestamp a chunk is placed, from the room's output delay
+	// setting, in microseconds.
+	delay int64
+
+	// drift is the smoothed error between the frame being rendered and the frame the server clock
+	// wants, in frames, positive when the room is playing early. corrected counts frames repeated
+	// (positive) or dropped (negative) to hold it.
+	drift     float64
+	corrected int64
+
+	// serverNow is the server clock, replaceable so a test can hold it still.
+	serverNow func() int64
 
 	late    atomic.Int64
 	dropped atomic.Int64
@@ -59,12 +88,22 @@ var (
 
 func newOut(p *speaker.Player) *out { return &out{p: p, gain: 1} }
 
-// use points the renderer at this session's clock. One server at a time, so it changes only between
-// sessions.
-func (o *out) use(clock *ssync.ClockSync) {
+// use points the renderer at this session's clock and the room's delay setting. One server at a time,
+// so it changes only between sessions.
+func (o *out) use(clock *ssync.ClockSync, delayMs int) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.clock = clock
+	o.serverNow = clock.ServerMicrosNow
+	o.delay = int64(delayMs) * 1000
+}
+
+// setDelay changes how much earlier the room plays. Chunks already placed stay where they are, so a
+// stream that is running hears one step of the change where the new placement meets the old.
+func (o *out) setDelay(ms int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.delay = int64(ms) * 1000
 }
 
 // open refuses anything the speaker cannot play, rather than playing it at the wrong speed.
@@ -101,7 +140,9 @@ func (o *out) write(at int64, samples []int16) {
 		return
 	}
 
-	frame := o.frameFor(at)
+	// The delay is taken off the timestamp, as the spec has it: the room plays earlier so that what
+	// is downstream of it sounds on time.
+	frame := o.frameFor(at - o.delay)
 	if frame > o.played && frame-o.played > holdMax {
 		o.dropped.Add(1)
 		return
@@ -179,9 +220,46 @@ func (o *out) Render(from uint64, buf []int16) {
 	if o.held || !o.ready || from < o.base {
 		return
 	}
+	o.correct(from)
 	for i := range min(len(buf), len(o.pcm)) {
 		buf[i] = scale(o.pcm[i], o.gain)
 	}
+}
+
+// correct holds the room to the server clock. Wants mu, and pcm's head at from.
+func (o *out) correct(from uint64) {
+	if !o.anchored || o.serverNow == nil || len(o.pcm) < 2*speaker.Channels {
+		return
+	}
+
+	// The frame the server clock says should be rendering now, against the one that is.
+	want := int64(o.frame) + (o.serverNow()-o.at)*speaker.Rate/1e6
+	o.drift += (float64(int64(from)-want) - o.drift) * driftGain
+
+	switch {
+	case o.drift > driftBand:
+		// Early: say the first frame twice, and move the anchor with it so what arrives next lands in
+		// step with what is already queued.
+		o.pcm = append(o.pcm, o.pcm[:speaker.Channels]...)
+		copy(o.pcm[speaker.Channels:], o.pcm[:len(o.pcm)-speaker.Channels])
+		o.frame++
+		o.drift--
+		o.corrected++
+	case o.drift < -driftBand:
+		// Late: skip the first frame.
+		n := copy(o.pcm, o.pcm[speaker.Channels:])
+		o.pcm = o.pcm[:n]
+		o.frame--
+		o.drift++
+		o.corrected--
+	}
+}
+
+// drifting reports the smoothed error in frames and the frames corrected so far, for the log.
+func (o *out) drifting() (drift float64, corrected int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.drift, o.corrected
 }
 
 // flush drops what has not been heard yet, and the anchor with it: what comes next is a new timeline.
@@ -196,6 +274,7 @@ func (o *out) reset() {
 	o.pcm = o.pcm[:0]
 	o.base = 0
 	o.anchored = false
+	o.drift = 0
 }
 
 func (o *out) misses() (late, dropped int64) { return o.late.Load(), o.dropped.Load() }
