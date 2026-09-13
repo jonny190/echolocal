@@ -393,6 +393,14 @@ func (p *Player) fill(buf []byte) {
 	// The tuning is for the driver, so the line-out is left with what it was sent.
 	tuned := mono && p.chain != nil && p.on.Load() && drain
 
+	// The vendor's volume is two halves: the gain its EQ bucket carries, in front of the tuning, and
+	// the curve's attenuation after it. Without this half the tuning runs at its quietest calibration
+	// however far up the dial it is.
+	makeup := float32(1)
+	if tuned {
+		makeup = float32(p.tuning.Makeup(float64(p.step.Load()) / VolumeSteps))
+	}
+
 	gain := p.Volume()
 	for i, j := 0, 0; i < period*Channels; i, j = i+Channels, j+1 {
 		var l, r int32
@@ -413,7 +421,7 @@ func (p *Player) fill(buf []byte) {
 			r = l
 		}
 		if tuned {
-			p.mono[j] = float32(clamp(l)) / full
+			p.mono[j] = float32(clamp(l)) / full * makeup
 			continue
 		}
 		binary.LittleEndian.PutUint16(buf[i*2:], uint16(int16(float32(clamp(l))*gain)))
@@ -429,7 +437,8 @@ func (p *Player) fill(buf []byte) {
 		p.chain.Reset()
 	}
 
-	// The tuning holds its own ceiling below full scale, so what comes back only has to be scaled.
+	// Volume attenuates what the tuning produced. It cannot go in front of it: the limiter holds a
+	// fixed ceiling, so anything turned down before it is pulled straight back up to the same level.
 	p.chain.Process(p.mono)
 	for i, j := 0, 0; i < period*Channels; i, j = i+Channels, j+1 {
 		s := int16(p.mono[j] * full * gain)

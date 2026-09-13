@@ -23,28 +23,58 @@ type mbclState struct {
 	work  [][]float32
 }
 
-// bandState is one band's compressor and limiter, sharing one gain so that the two never fight: the
-// compressor asks for a reduction, the limiter asks for whatever more it takes to stay under its
-// threshold, and the sum is what the gain moves toward. The gain is carried in dB, so smoothing moves
-// it at a rate that does not depend on how far down it already is.
+// bandState is one band's compressor followed by its limiter, the comp_ and lim_ settings the file
+// gives each band, in series. The compressor's gain is carried in dB, so smoothing moves it at a rate
+// that does not depend on how far down it already is.
 type bandState struct {
 	compThreshDB  float64
 	compRatio     float64
 	compGainMinDB float64
-	limThreshDB   float64
 
 	env    float64
 	gainDB float64
 	attack float64
 	relCo  float64
+
+	lim *limiter
 }
 
-// limiter is a gain that only ever comes down to hold a threshold.
+// lookahead is how far ahead the limiter sees a peak coming, which is how long it has to bring the
+// gain down before one arrives, and the delay it costs the playback path.
+const lookahead = 2 * time.Millisecond
+
+// limiter holds a ceiling by looking ahead: the signal is delayed, the gain each sample will need is
+// worked out as it arrives, and the gain follows the lowest of those still to come. That gives it the
+// lookahead to arrive smoothly, and a gain that moves smoothly is a gain that stays inaudible.
 type limiter struct {
-	threshDB float64
-	gainDB   float64
-	attack   float64
-	relCo    float64
+	ceiling float64
+	gain    float64
+	attack  float64
+	relCo   float64
+
+	// delay holds the samples not yet let out, and want the gain each of them will need. front is the
+	// oldest of both. low holds the indices of want still in the running for the lowest, rising, so its
+	// head is the lowest of everything still to come; it is a ring of its own to keep this allocation
+	// free at 48 kHz.
+	delay []float32
+	want  []float64
+	front int
+	low   []int
+	head  int
+	tail  int
+}
+
+// pushLow drops everything that can no longer be the lowest and adds i, keeping low rising.
+func (l *limiter) pushLow(i int, want float64) {
+	for l.head != l.tail {
+		back := (l.tail - 1 + len(l.low)) % len(l.low)
+		if l.want[l.low[back]] < want {
+			break
+		}
+		l.tail = back
+	}
+	l.low[l.tail] = i
+	l.tail = (l.tail + 1) % len(l.low)
 }
 
 func newMBCL(m mbcl, rate int) (*mbclState, error) {
@@ -54,11 +84,7 @@ func newMBCL(m mbcl, rate int) (*mbclState, error) {
 
 	s := &mbclState{
 		split: newCrossover(m.Crossovers, rate),
-		full: &limiter{
-			threshDB: m.Full.LimThresh,
-			attack:   smoothing(attack, rate),
-			relCo:    smoothing(millis(m.Full.LimRelease), rate),
-		},
+		full:  newLimiter(m.Full.LimThresh, millis(m.Full.LimRelease), rate),
 	}
 
 	for _, b := range m.Bands {
@@ -72,12 +98,27 @@ func newMBCL(m mbcl, rate int) (*mbclState, error) {
 			compThreshDB:  b.CompThresh,
 			compRatio:     b.CompRatio,
 			compGainMinDB: b.CompGainMin,
-			limThreshDB:   b.LimThresh,
 			attack:        smoothing(attack, rate),
 			relCo:         smoothing(millis(b.LimRelease), rate),
+			lim:           newLimiter(b.LimThresh, millis(b.LimRelease), rate),
 		})
 	}
 	return s, nil
+}
+
+// newLimiter sizes the lookahead and the attack together: the gain has exactly the lookahead to reach
+// what a peak asks for, so it covers almost all of that distance in that many samples.
+func newLimiter(threshDB float64, rel time.Duration, rate int) *limiter {
+	n := max(int(lookahead.Seconds()*float64(rate)), 1)
+	return &limiter{
+		ceiling: math.Pow(10, threshDB/20),
+		gain:    1,
+		attack:  1 - math.Exp(-4/float64(n)),
+		relCo:   smoothing(rel, rate),
+		delay:   make([]float32, n),
+		want:    make([]float64, n),
+		low:     make([]int, n+1),
+	}
 }
 
 // smoothing is the per-sample coefficient of a one-pole that covers most of its distance in d.
@@ -95,8 +136,15 @@ func (s *mbclState) reset() {
 	s.split.reset()
 	for _, b := range s.bands {
 		b.env, b.gainDB = 0, 0
+		b.lim.reset()
 	}
-	s.full.gainDB = 0
+	s.full.reset()
+}
+
+func (l *limiter) reset() {
+	l.gain, l.front, l.head, l.tail = 1, 0, 0, 0
+	clear(l.delay)
+	clear(l.want)
 }
 
 // process splits the block into bands, rides each one's gain, and sums them back under a limiter.
@@ -123,7 +171,7 @@ func (s *mbclState) process(x []float32) {
 	s.full.process(x)
 }
 
-// process rides one band's gain.
+// process compresses one band and then holds it under its own ceiling.
 func (b *bandState) process(x []float32) {
 	for i, v := range x {
 		level := b.track(float64(v))
@@ -133,13 +181,11 @@ func (b *bandState) process(x []float32) {
 			want = -(level - b.compThreshDB) * (1 - 1/b.compRatio)
 			want = math.Max(want, b.compGainMinDB)
 		}
-		if out := level + want; out > b.limThreshDB {
-			want -= out - b.limThreshDB
-		}
 
 		b.gainDB = approach(b.gainDB, want, b.attack, b.relCo)
 		x[i] = float32(float64(v) * math.Pow(10, b.gainDB/20))
 	}
+	b.lim.process(x)
 }
 
 // track follows the band's peak, falling at the release rate, and reports it in dB.
@@ -157,21 +203,33 @@ func (b *bandState) track(v float64) float64 {
 }
 
 func (l *limiter) process(x []float32) {
+	n := len(l.delay)
 	for i, v := range x {
-		want := 0.0
-		if a := math.Abs(float64(v)); a > 0 {
-			if level := 20 * math.Log10(a); level > l.threshDB {
-				want = l.threshDB - level
-			}
+		want := 1.0
+		if a := math.Abs(float64(v)); a > l.ceiling {
+			want = l.ceiling / a
 		}
 
-		l.gainDB = approach(l.gainDB, want, l.attack, l.relCo)
-		out := float64(v) * math.Pow(10, l.gainDB/20)
+		l.want[l.front] = want
+		l.pushLow(l.front, want)
 
-		// The gain is still on its way down when a transient arrives faster than the attack, so the
-		// threshold is held here as well. Nothing downstream gets to clip.
-		ceil := math.Pow(10, l.threshDB/20)
-		x[i] = float32(math.Max(-ceil, math.Min(ceil, out)))
+		out := l.delay[l.front]
+		l.delay[l.front] = v
+		l.front = (l.front + 1) % n
+		if l.low[l.head] == l.front {
+			l.head = (l.head + 1) % len(l.low)
+		}
+
+		target := l.want[l.low[l.head]]
+		if target < l.gain {
+			l.gain += (target - l.gain) * l.attack
+		} else {
+			l.gain += (target - l.gain) * l.relCo
+		}
+
+		// The gain arrives ahead of the peak, so this only has to catch what rounding leaves.
+		v := float64(out) * l.gain
+		x[i] = float32(math.Max(-l.ceiling, math.Min(l.ceiling, v)))
 	}
 }
 

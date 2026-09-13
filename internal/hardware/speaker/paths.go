@@ -52,7 +52,7 @@ var pathSequence = map[Output][]kctl{
 		{name: "HPR Output Mixer R_DAC Switch", level: 1},
 		{name: "Audio_DacMux_Setting", value: "Off"},
 		{name: "Right Channel Only", value: "On"},
-		{name: driverGain, level: 10},
+		{name: driverGain, level: 6},
 	},
 	OutputHeadphone: {
 		{name: "Ignore Ramp Up", value: "On"},

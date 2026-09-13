@@ -262,7 +262,7 @@ func TestVendorMBCLIsTheOneWeBuiltFor(t *testing.T) {
 
 func TestLoadRejectsAWrongLengthFilter(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, eqFile), []byte("1.0,\n2.0,\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, eqFiles[0].name), []byte("1.0,\n2.0,\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Load(dir); err == nil {

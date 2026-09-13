@@ -10,6 +10,7 @@ package asp
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 )
 
@@ -22,33 +23,91 @@ const Rate = 48000
 // taps is the length of the tuning filter. A file of any other length is a tuning we do not know.
 const taps = 1024
 
-// eqFile is the tuning filter to load. The vendor ships one shape in six files that differ only in
-// broadband gain, which is how it gets louder: EQ_100 carries 14.5 dB more than this one. Taking the
-// unity bucket leaves loudness to the volume curve we already have.
-const eqFile = "EQ_50.cfg"
+// eqFiles are the vendor's volume-dependent EQ, with the volume boundary each one reaches up to. The
+// six hold one filter shape and differ only in the gain in front of it, which is half of how the
+// device gets louder; the attenuation in the volume curve is the other half.
+var eqFiles = []struct {
+	upTo float64
+	name string
+}{
+	{0.5, "EQ_50.cfg"},
+	{0.6, "EQ_60.cfg"},
+	{0.7, "EQ_70.cfg"},
+	{0.8, "EQ_80.cfg"},
+	{0.9, "EQ_90.cfg"},
+	{1.0, "EQ_100.cfg"},
+}
 
 // mbclFile is the compressor and limiter that sits under the tuning.
 const mbclFile = "MBCL.cfg"
 
 // Tuning is a loaded tuning, shared and read-only. Chain turns it into something that can process.
 type Tuning struct {
-	taps []float32
-	mbcl mbcl
+	taps  []float32
+	gains []float64 // what each bucket puts in front of taps, linear, in eqFiles order
+	mbcl  mbcl
 }
 
 // Load reads a tuning out of a directory, normally VendorDir.
 func Load(dir string) (*Tuning, error) {
-	h, err := readFloats(filepath.Join(dir, eqFile), taps)
-	if err != nil {
-		return nil, err
+	t := &Tuning{}
+	for _, e := range eqFiles {
+		h, err := readFloats(filepath.Join(dir, e.name), taps)
+		if err != nil {
+			return nil, err
+		}
+		if t.taps == nil {
+			t.taps, t.gains = h, []float64{1}
+			continue
+		}
+
+		// The filter is taken from the first file and the rest are read for their gain alone, so this
+		// insists they really are the same filter: a set that is not would need a filter each.
+		g, err := scaleOf(t.taps, h)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", e.name, err)
+		}
+		t.gains = append(t.gains, g)
 	}
 
 	m, err := readMBCL(filepath.Join(dir, mbclFile))
 	if err != nil {
 		return nil, err
 	}
+	t.mbcl = m
+	return t, nil
+}
 
-	return &Tuning{taps: h, mbcl: m}, nil
+// scaleOf reports how much bigger b is than a, and refuses anything that is not a scaled copy of it.
+func scaleOf(a, b []float32) (float64, error) {
+	var ab, aa float64
+	for i := range a {
+		ab += float64(a[i]) * float64(b[i])
+		aa += float64(a[i]) * float64(a[i])
+	}
+	g := ab / aa
+
+	var off, tot float64
+	for i := range a {
+		d := float64(b[i]) - g*float64(a[i])
+		off += d * d
+		tot += float64(b[i]) * float64(b[i])
+	}
+	if off/tot > 1e-9 {
+		return 0, fmt.Errorf("a different filter, not the same one %.2f dB louder", 20*math.Log10(g))
+	}
+	return g, nil
+}
+
+// Makeup is the gain the vendor puts in front of the filter at this fraction of full volume: the
+// first bucket the volume reaches up to, and the last of them for anything above the rest.
+func (t *Tuning) Makeup(of float64) float64 {
+	for i, e := range eqFiles {
+		if of <= e.upTo {
+			return t.gains[i]
+		}
+	}
+	return t.gains[len(t.gains)-1]
 }
 
 // Chain is a tuning applied to one stream. It holds the filter history and the compressor's
