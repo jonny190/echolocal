@@ -34,6 +34,18 @@ func TestSplitRC(t *testing.T) {
 			wantRC:  0,
 		},
 		{
+			name:    "output landing after the marker still yields a status",
+			raw:     rcMarker + "1\r\n/nope: No such file or directory\r\n",
+			wantOut: "/nope: No such file or directory",
+			wantRC:  1,
+		},
+		{
+			name:    "output split across the marker is rejoined",
+			raw:     "before\r\n" + rcMarker + "1\r\nafter\r\n",
+			wantOut: "before\nafter",
+			wantRC:  1,
+		},
+		{
 			name:    "missing marker is an error, not a silent zero",
 			raw:     "truncated output\r\n",
 			wantErr: true,

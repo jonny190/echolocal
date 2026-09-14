@@ -29,7 +29,7 @@ import (
 
 func init() {
 	// Last: it serves the registry, so nothing should still be coming up when it starts listening.
-	component.Register(component.Network, Get(), component.Order(99))
+	component.Register(component.Network, Get, component.Order(99))
 }
 
 // One of Home Assistant's keepalive intervals; it gives up on us at 4.5 of them.

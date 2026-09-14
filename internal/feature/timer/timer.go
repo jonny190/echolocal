@@ -27,7 +27,7 @@ import (
 )
 
 func init() {
-	component.Register(component.Device, Get(), component.Order(31))
+	component.Register(component.Device, Get, component.Order(31))
 }
 
 const (

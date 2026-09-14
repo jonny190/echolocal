@@ -17,7 +17,7 @@ import (
 const Period = 5 * time.Minute
 
 func init() {
-	component.Register(component.Device, Get(), component.Order(80))
+	component.Register(component.Device, Get, component.Order(80))
 }
 
 var (

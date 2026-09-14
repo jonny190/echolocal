@@ -24,11 +24,17 @@ type Registry struct {
 }
 
 type entry struct {
+	make  func() Component
+	once  sync.Once
 	c     Component
 	phase Phase
 	order int
 	opts  []service.Option
 }
+
+// resolve builds the component, once. Every walk goes through sorted, which resolves before anything
+// reads c.
+func (e *entry) resolve() { e.once.Do(func() { e.c = e.make() }) }
 
 // Option adjusts one registration.
 type Option func(*entry)
@@ -48,14 +54,19 @@ func New() *Registry { return &Registry{} }
 var shared = New()
 
 // Register adds to the process-wide registry, from a component package's init.
-func Register(p Phase, c Component, opts ...Option) { shared.Add(p, c, opts...) }
+//
+// What is registered is the constructor, not the component: init runs on every invocation of the
+// binary, and building a component opens the hardware it drives. Only the agent should do that.
+func Register[T Component](p Phase, make func() T, opts ...Option) {
+	shared.Add(p, func() Component { return make() }, opts...)
+}
 
 // Default is the process-wide registry.
 func Default() *Registry { return shared }
 
-// Add registers a component.
-func (r *Registry) Add(p Phase, c Component, opts ...Option) {
-	e := &entry{c: c, phase: p}
+// Add registers a component, built on first use and once.
+func (r *Registry) Add(p Phase, make func() Component, opts ...Option) {
+	e := &entry{make: make, phase: p}
 	for _, o := range opts {
 		o(e)
 	}
@@ -172,6 +183,12 @@ func (r *Registry) sorted() []*entry {
 	r.mu.Lock()
 	out := slices.Clone(r.entries)
 	r.mu.Unlock()
+
+	// Outside the lock: a constructor is the component's own code and has no business being run with
+	// the registry held.
+	for _, e := range out {
+		e.resolve()
+	}
 
 	slices.SortStableFunc(out, func(a, b *entry) int {
 		if v := cmp.Compare(a.phase, b.phase); v != 0 {

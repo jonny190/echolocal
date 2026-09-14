@@ -312,7 +312,8 @@ func (d *Device) shell(cmd string) (string, int, error) {
 	return out, code, nil
 }
 
-// splitRC separates output from the trailing exit-status marker.
+// splitRC separates output from the trailing exit-status marker. Only the marker's own line is read
+// as the status, so anything landing after it is returned rather than failing the parse.
 func splitRC(raw string) (string, int, error) {
 	out := strings.ReplaceAll(raw, "\r\n", "\n")
 
@@ -320,11 +321,19 @@ func splitRC(raw string) (string, int, error) {
 	if i < 0 {
 		return out, 0, fmt.Errorf("no %s marker in output %q", rcMarker, out)
 	}
-	code, err := strconv.Atoi(strings.TrimSpace(out[i+len(rcMarker):]))
+	status, trailing, _ := strings.Cut(out[i+len(rcMarker):], "\n")
+	code, err := strconv.Atoi(strings.TrimSpace(status))
 	if err != nil {
 		return out, 0, fmt.Errorf("unparseable exit status in %q", out[i:])
 	}
-	return strings.TrimSuffix(out[:i], "\n"), code, nil
+	text := strings.TrimSuffix(out[:i], "\n")
+	if trailing = strings.TrimSuffix(trailing, "\n"); trailing != "" {
+		if text != "" {
+			text += "\n"
+		}
+		text += trailing
+	}
+	return text, code, nil
 }
 
 // Exists reports whether a path is present.

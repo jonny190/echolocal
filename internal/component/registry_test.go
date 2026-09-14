@@ -43,17 +43,21 @@ func names(cs []Component) []string {
 	return out
 }
 
+// val registers a component that is already built, which is what these tests want: they are about
+// ordering and wiring, not construction.
+func val(c Component) func() Component { return func() Component { return c } }
+
 // Phase decides first, then the declared order, then the name. Registration order decides nothing,
 // because it is Go's import graph and not a decision anybody made.
 func TestOrderIsDeclaredNotRegistered(t *testing.T) {
 	r := New()
 
-	r.Add(Network, bare{"api"})
-	r.Add(Hardware, bare{"speaker"}, Order(20))
-	r.Add(Device, bare{"voice"})
-	r.Add(Hardware, bare{"led"}, Order(10))
-	r.Add(Hardware, bare{"zzz"}, Order(10))
-	r.Add(Hardware, bare{"aaa"}, Order(10))
+	r.Add(Network, val(bare{"api"}))
+	r.Add(Hardware, val(bare{"speaker"}), Order(20))
+	r.Add(Device, val(bare{"voice"}))
+	r.Add(Hardware, val(bare{"led"}), Order(10))
+	r.Add(Hardware, val(bare{"zzz"}), Order(10))
+	r.Add(Hardware, val(bare{"aaa"}), Order(10))
 
 	want := []string{"aaa", "led", "zzz", "speaker", "voice", "api"}
 	if got := names(r.All()); !slices.Equal(got, want) {
@@ -81,9 +85,9 @@ func TestWhatReachesTheSupervisor(t *testing.T) {
 	r := New()
 	loop, setup := newFull("speaker"), newOnce("procs")
 
-	r.Add(Hardware, bare{"nothing"})
-	r.Add(Hardware, loop)
-	r.Add(Hardware, setup)
+	r.Add(Hardware, val(bare{"nothing"}))
+	r.Add(Hardware, val(loop))
+	r.Add(Hardware, val(setup))
 
 	g := r.Group()
 	if n := len(g.Status()); n != 2 {
@@ -119,9 +123,9 @@ func TestOptionalHalves(t *testing.T) {
 	r := New()
 	second, first := newFull("second"), newFull("first")
 
-	r.Add(Device, second, Order(2))
-	r.Add(Device, first, Order(1))
-	r.Add(Device, bare{"nothing"}, Order(3))
+	r.Add(Device, val(second), Order(2))
+	r.Add(Device, val(first), Order(1))
+	r.Add(Device, val(bare{"nothing"}), Order(3))
 
 	ents := r.Entities()
 	if len(ents) != 2 {
