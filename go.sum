@@ -131,6 +131,8 @@ github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e h1:JVG44RsyaB9T2KIHavM
 github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e/go.mod h1:RbqR21r5mrJuqunuUZ/Dhy/avygyECGrLceyNeo4LiM=
 github.com/ygelfand/go-esphome-device v0.0.4 h1:WhoMOGAwRFXv22LYDGUqmb2YTXLwz0goQtMFQYu6ygs=
 github.com/ygelfand/go-esphome-device v0.0.4/go.mod h1:Rrbk7Xmsx2Au87DCXhPfOvI8O7OXFtWqUjxqiGL0nCQ=
+github.com/ygelfand/go-esphome-device v0.0.5 h1:croS8nu+crIiVTff57VfrLeBfuKkoFJOoC1qegddLik=
+github.com/ygelfand/go-esphome-device v0.0.5/go.mod h1:Rrbk7Xmsx2Au87DCXhPfOvI8O7OXFtWqUjxqiGL0nCQ=
 github.com/zserge/microwakeword v0.0.0-20260330234603-bfaf3840114e h1:W7Rfr8nl15z15s6EMHGiuJjySfrgy2uJweO5Kk6mImo=
 github.com/zserge/microwakeword v0.0.0-20260330234603-bfaf3840114e/go.mod h1:O7dsX2fwJHkPSXYjkoXLY6XH327YXyLdDfPWmb7OQW8=
 go.yaml.in/yaml/v3 v3.0.4 h1:tfq32ie2Jv2UxXFdLJdh3jXuOzWiL1fo0bu/FbuKpbc=
