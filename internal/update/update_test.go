@@ -12,18 +12,22 @@ func somewhere(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 
-	t.Cleanup(func() { prev, old, mount, writable = layoutPrev, layoutOld, layoutMount, remount })
+	t.Cleanup(func() { prev, old, mount, writable, reboot = layoutPrev, layoutOld, layoutMount, remount, layoutReboot })
 	prev, old, mount = filepath.Join(dir, "echod.prev"), filepath.Join(dir, "echod.old"), dir
 
 	// The directory is already writable, so the remount is the one thing that cannot be exercised here.
 	writable = func(bool) error { return nil }
+
+	// Android is not here, so nothing asks init for a reboot unless a test means to.
+	reboot = func() {}
 	return dir
 }
 
 var (
-	layoutPrev  = prev
-	layoutOld   = old
-	layoutMount = mount
+	layoutPrev   = prev
+	layoutOld    = old
+	layoutMount  = mount
+	layoutReboot = reboot
 )
 
 func TestOnTrialIsThePresenceOfPrev(t *testing.T) {
@@ -97,5 +101,20 @@ func TestRestartCoalesces(t *testing.T) {
 	case got := <-Wanted():
 		t.Errorf("a second request was queued: %q", got)
 	default:
+	}
+}
+
+// Reboot is the ask, not the doing: what happens after the property is set is init's, so the test
+// proves the ask gets made once.
+func TestRebootAsksInit(t *testing.T) {
+	somewhere(t)
+
+	asked := make(chan string, 1)
+	reboot = func() { asked <- "asked" }
+
+	Reboot("testing")
+
+	if got := <-asked; got != "asked" {
+		t.Errorf("reboot sent %q, want the ask to init", got)
 	}
 }

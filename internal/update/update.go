@@ -164,10 +164,18 @@ func RolledBack() string {
 	return was
 }
 
-// reboot asks init for a clean one, which unwinds the services it started rather than dropping the
-// device where it stands.
-func reboot() {
+// reboot asks init for a clean reboot, which unwinds the services it started rather than dropping
+// the device where it stands. A variable so a test can see the ask.
+var reboot = func() {
 	if err := prop.Set("sys.powerctl", "reboot"); err != nil {
 		slog.Error("asking init to reboot failed", "err", err)
 	}
+}
+
+// Reboot asks init for a clean reboot. Unlike Restart, which replaces this process with a new one of
+// itself, the whole device comes back: init unwinds the services it started, then starts them again,
+// so echod returns on its own.
+func Reboot(why string) {
+	slog.Info("rebooting", "why", why)
+	reboot()
 }
