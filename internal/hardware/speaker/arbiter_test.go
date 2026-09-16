@@ -6,25 +6,18 @@ import (
 )
 
 // producer records what it was told. What matters is the state it is left in — a producer left
-// suspended never plays again and nothing reports an error about it.
+// standing down never plays again and nothing reports an error about it.
 type producer struct {
 	mu       sync.Mutex
-	suspends int
-	resumes  int
+	down     bool
 	ducked   bool
 	requeues int
 }
 
-func (p *producer) Suspend() {
+func (p *producer) Stand(down bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.suspends++
-}
-
-func (p *producer) Resume() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.resumes++
+	p.down = down
 }
 
 func (p *producer) Duck(on bool) {
@@ -48,7 +41,7 @@ func (p *producer) requeued() int {
 func (p *producer) held() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.suspends > p.resumes
+	return p.down
 }
 
 func (p *producer) quiet() bool {
@@ -86,7 +79,7 @@ func TestWhatWasInterruptedCarriesOn(t *testing.T) {
 	a.Gave(track)
 
 	if group.held() {
-		t.Errorf("the group never came back: %d suspends, %d resumes", group.suspends, group.resumes)
+		t.Error("the group never came back: still standing down with nothing above it")
 	}
 	if a.Playing() != group {
 		t.Error("the group is not the one being heard again")
@@ -118,7 +111,7 @@ func TestTheDriverHoldWinsOverAHandover(t *testing.T) {
 	group, track := &producer{}, &producer{}
 	a.Took(group)
 
-	a.Suspend()
+	a.Stand(true)
 	if !group.held() {
 		t.Fatal("the group ignored the driver taking the speaker")
 	}
@@ -129,9 +122,9 @@ func TestTheDriverHoldWinsOverAHandover(t *testing.T) {
 		t.Error("a track that started while the speaker was held began playing")
 	}
 
-	a.Resume()
+	a.Stand(false)
 	if track.held() {
-		t.Errorf("the track never started: %d suspends, %d resumes", track.suspends, track.resumes)
+		t.Error("the track never started: still standing down after the claim ended")
 	}
 }
 
@@ -226,7 +219,7 @@ func TestAResumingTrackRetakingTheSpeakerIsNotHeldTwice(t *testing.T) {
 	track := &producer{}
 	a.Took(track)
 
-	a.Suspend()
+	a.Stand(true)
 	if !track.held() {
 		t.Fatal("the track ignored the driver taking the speaker")
 	}
@@ -237,9 +230,9 @@ func TestAResumingTrackRetakingTheSpeakerIsNotHeldTwice(t *testing.T) {
 		t.Error("a track must stay stood down while the speaker is held")
 	}
 
-	a.Resume()
+	a.Stand(false)
 	if track.held() {
-		t.Errorf("the track never came back: %d suspends, %d resumes", track.suspends, track.resumes)
+		t.Error("the track never came back: still standing down after the claim ended")
 	}
 }
 
@@ -251,7 +244,7 @@ func TestARetakeAfterGivingBackDuringAHoldIsNotHeldTwice(t *testing.T) {
 	track := &producer{}
 	a.Took(track)
 
-	a.Suspend()
+	a.Stand(true)
 	if !track.held() {
 		t.Fatal("the track ignored the driver taking the speaker")
 	}
@@ -263,8 +256,61 @@ func TestARetakeAfterGivingBackDuringAHoldIsNotHeldTwice(t *testing.T) {
 		t.Error("a track must stay stood down while the speaker is held")
 	}
 
-	a.Resume()
+	a.Stand(false)
 	if track.held() {
-		t.Errorf("the track never came back: %d suspends, %d resumes", track.suspends, track.resumes)
+		t.Error("the track never came back: still standing down after the claim ended")
+	}
+}
+
+// A producer that takes the speaker back while another is standing down for it is the one heard.
+// Leaving both down is the wedge where something reports that it is playing to a silent room.
+func TestARetakeIsHeardRatherThanLeftStandingDown(t *testing.T) {
+	a := &Arbiter{}
+	stream, spin := &producer{}, &producer{}
+
+	a.Took(stream)
+	a.Took(spin)
+	a.Took(stream)
+
+	if stream.held() {
+		t.Error("the producer that took the speaker back is still standing down, so nothing is audible")
+	}
+	if !spin.held() {
+		t.Error("the producer it took over from is still playing")
+	}
+	if a.Playing() != stream {
+		t.Error("the one being heard is not the one that took the speaker last")
+	}
+}
+
+// Owns is what says whether the audio waiting in the queue may be thrown away. Getting it from a
+// producer's own standing is what turns a stop during a reply into a reply cut off mid-word.
+func TestTheQueueBelongsToWhateverIsBeingHeard(t *testing.T) {
+	a := &Arbiter{}
+	track, spin := &producer{}, &producer{}
+
+	a.Took(track)
+	if !a.Owns(track) {
+		t.Error("the only producer does not own the queue it is filling")
+	}
+
+	a.Stand(true)
+	if a.Owns(track) {
+		t.Error("the queue is the claim's while the claim has the speaker")
+	}
+	a.Stand(false)
+
+	a.Took(spin)
+	if a.Owns(track) {
+		t.Error("the queue belongs to what took over, not to what stood down for it")
+	}
+	if !a.Owns(spin) {
+		t.Error("the producer being heard does not own the queue")
+	}
+
+	a.Gave(spin)
+	a.Gave(track)
+	if !a.Owns(track) {
+		t.Error("with nothing being heard there is no one else's audio to protect")
 	}
 }

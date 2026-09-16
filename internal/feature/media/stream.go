@@ -59,14 +59,16 @@ type Stream struct {
 	mu    sync.Mutex
 	track *track
 
-	// holds counts what has taken the speaker: a turn, a reply, an announcement. Playing resumes
-	// when the last of them gives it back, which is why it counts rather than being a flag.
-	holds  int
+	// down is where the arbiter last said this stream stands. It is told in full whenever anything
+	// moves, so it is a copy of the answer rather than a tally of what has happened: nothing here has
+	// to be undone as many times as it was done.
+	down   bool
 	paused bool
 
-	// duckHeld is whether the duck was the thing that suspended, which only happens when the setting
-	// says pause. Ending the duck must not release a hold that a reply put there.
-	duckHeld bool
+	// quiet is whether a turn wants silence rather than a lower level, which is what the setting says
+	// when it says pause. It is its own reason to be gated, so ending a turn says nothing about a
+	// reply that is also waiting to be answered.
+	quiet bool
 
 	// gate is closed to let the stream carry on, and non-nil for as long as it may not.
 	gate chan struct{}
@@ -118,38 +120,26 @@ func (m *Stream) Duck(on bool) {
 		return
 	}
 
-	if on {
-		if config.Get().Media.OnTurn == config.OnTurnPause {
-			m.mu.Lock()
-			m.duckHeld = true
-			m.mu.Unlock()
+	// Read once: the setting can be changed in the middle of a turn, and a turn has to end the way it
+	// began or the level it set is left on.
+	pause := on && config.Get().Media.OnTurn == config.OnTurnPause
 
-			m.Suspend()
-			return
-		}
-
-		level := float32(math.Pow(10, float64(config.Get().Media.DuckDB)/20))
-		m.write.Lock()
-		m.target = level
-		m.write.Unlock()
-
-		return
+	level := float32(1)
+	if on && !pause {
+		level = float32(math.Pow(10, float64(config.Get().Media.DuckDB)/20))
 	}
-
-	// Both are undone whatever the setting was when the turn began, since it can be changed in the
-	// middle of one. Resuming is conditional on this having been what suspended: holds is shared with
-	// the claims, and releasing one of theirs would put music back underneath a reply.
 	m.write.Lock()
-	m.target = 1
+	m.target = level
 	m.write.Unlock()
 
 	m.mu.Lock()
-	held := m.duckHeld
-	m.duckHeld = false
+	take := pause && !m.quiet && m.track != nil
+	m.quiet = pause
+	m.regate()
 	m.mu.Unlock()
 
-	if held {
-		m.Resume()
+	if take {
+		m.keep()
 	}
 }
 
@@ -225,11 +215,7 @@ func (m *Stream) start(t *track) (*track, context.Context) {
 	m.mu.Lock()
 	previous := m.track
 	m.track, m.paused, m.rewind = t, false, nil
-	if m.holds == 0 {
-		m.unblock()
-	} else {
-		m.block()
-	}
+	m.regate()
 	m.mu.Unlock()
 
 	previous.stop()
@@ -256,11 +242,12 @@ func (m *Stream) Pause() {
 		return
 	}
 	m.paused = true
-	m.block()
-	ours := m.holds == 0
+	m.regate()
 	m.mu.Unlock()
 
-	if ours {
+	// Asked of the arbiter rather than of this stream's own standing: what is queued is only ours to
+	// put aside while nothing else is being heard.
+	if m.bg.Owns(m) {
 		m.keep()
 	}
 	m.changed()
@@ -278,9 +265,7 @@ func (m *Stream) Unpause() {
 		return
 	}
 	m.paused = false
-	if m.holds == 0 {
-		m.unblock()
-	}
+	m.regate()
 	m.mu.Unlock()
 
 	m.changed()
@@ -308,38 +293,28 @@ func (m *Stream) Stop() {
 	m.changed()
 }
 
-// Suspend implements speaker.Background: something else wants the speaker.
-func (m *Stream) Suspend() {
+// Stand implements speaker.Producer: the arbiter says whether this stream may be heard. The same
+// standing arriving twice is the arbiter repeating itself, not a second thing wanting the speaker.
+func (m *Stream) Stand(down bool) {
 	if m == nil {
 		return
 	}
 
 	m.mu.Lock()
-	m.holds++
-	if m.track == nil || m.holds > 1 {
-		m.mu.Unlock()
-		return
+	first := down && !m.down
+	take := first && m.track != nil
+	m.down = down
+	if down {
+		m.block()
+	} else if !m.paused {
+		m.unblock()
 	}
-	m.block()
 	m.mu.Unlock()
 
-	m.keep()
-}
-
-// Resume implements speaker.Background: the speaker is free again.
-func (m *Stream) Resume() {
-	if m == nil {
-		return
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.holds > 0 {
-		m.holds--
-	}
-	if m.holds == 0 && !m.paused {
-		m.unblock()
+	// Only on the way down, and only with a track: what is queued is this stream's to put aside then,
+	// and taking it at any other time would be taking someone else's.
+	if take {
+		m.keep()
 	}
 }
 
@@ -357,6 +332,17 @@ func (m *Stream) Playing() (playing, paused bool) {
 }
 
 // block and unblock hold and release the stream. Both want mu.
+// regate opens the gate when nothing wants this stream quiet and closes it when anything does. Every
+// reason is a state of its own, so this can be worked out again at any time rather than having to be
+// arrived at by the right sequence of steps. Called with mu held.
+func (m *Stream) regate() {
+	if m.down || m.quiet || m.paused {
+		m.block()
+		return
+	}
+	m.unblock()
+}
+
 func (m *Stream) block() {
 	if m.gate == nil {
 		m.gate = make(chan struct{})
@@ -373,10 +359,7 @@ func (m *Stream) unblock() {
 // flush throws away audio that is ours to throw away. While something else holds the speaker the
 // queue belongs to it, and emptying it would cut off a reply.
 func (m *Stream) flush() {
-	m.mu.Lock()
-	held := m.holds > 0
-	m.mu.Unlock()
-	if held {
+	if !m.bg.Owns(m) {
 		return
 	}
 

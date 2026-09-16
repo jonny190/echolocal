@@ -7,32 +7,25 @@ import (
 	"time"
 )
 
-// counted is a Background that records what it was told, so the tests can check the driver left it
+// counted is a Background that keeps what it was last told, so the tests can check the driver left it
 // able to play rather than merely that it called something.
 type counted struct {
-	mu       sync.Mutex
-	suspends int
-	resumes  int
+	mu   sync.Mutex
+	down bool
 }
 
-func (b *counted) Suspend() {
+func (b *counted) Stand(down bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.suspends++
-}
-
-func (b *counted) Resume() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.resumes++
+	b.down = down
 }
 
 // held is whether the background is still standing down, which is the thing that matters: a
-// background left suspended never plays again, and nothing reports an error about it.
+// background left standing down never plays again, and nothing reports an error about it.
 func (b *counted) held() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.suspends > b.resumes
+	return b.down
 }
 
 func TestBackgroundPlaysAgainAfterOneSound(t *testing.T) {
@@ -43,8 +36,7 @@ func TestBackgroundPlaysAgainAfterOneSound(t *testing.T) {
 	waitFor(t, d.Claim("one", func(context.Context, *Player) error { return nil }))
 
 	if bg.held() {
-		t.Fatalf("still suspended after the only sound finished: %d suspends, %d resumes",
-			bg.suspends, bg.resumes)
+		t.Fatal("still standing down after the only sound finished")
 	}
 }
 
@@ -67,8 +59,7 @@ func TestBackgroundPlaysAgainAfterOneSoundDisplacesAnother(t *testing.T) {
 	waitFor(t, first)
 
 	if bg.held() {
-		t.Fatalf("still suspended after both sounds finished: %d suspends, %d resumes",
-			bg.suspends, bg.resumes)
+		t.Fatal("still standing down after both sounds finished")
 	}
 }
 
@@ -90,8 +81,7 @@ func TestBackgroundPlaysAgainAfterSilence(t *testing.T) {
 	waitFor(t, c)
 
 	if bg.held() {
-		t.Fatalf("still suspended after being silenced: %d suspends, %d resumes",
-			bg.suspends, bg.resumes)
+		t.Fatal("still standing down after being silenced")
 	}
 }
 
@@ -106,7 +96,6 @@ func TestBackgroundSurvivesAStreamOfSounds(t *testing.T) {
 	}
 
 	if bg.held() {
-		t.Fatalf("still suspended after twenty sounds: %d suspends, %d resumes",
-			bg.suspends, bg.resumes)
+		t.Fatal("still standing down after twenty sounds")
 	}
 }

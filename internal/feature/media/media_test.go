@@ -115,3 +115,27 @@ func TestHeaderRefusesAnOversizedChunk(t *testing.T) {
 		t.Fatal("accepted a chunk of a gigabyte")
 	}
 }
+
+// Stopping a track while a reply has the speaker must leave the queue alone: what is waiting in it is
+// the reply's, and emptying it cuts the phrase off mid-word. The stream cannot answer that from its own
+// standing, because by the time it flushes it has left the arbiter and stands down for nothing — the
+// sequence here is the one Stop runs, with the leave already done.
+//
+// out is nil on purpose. Draining is the only thing this touches it for, so reaching the queue at all
+// is the failure, and it says so without needing a device to watch.
+func TestFlushingUnderAClaimLeavesTheReplyAlone(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("the flush emptied the queue while a reply had the speaker: %v", r)
+		}
+	}()
+
+	sound := &speaker.Driver{}
+	m := &Stream{bg: sound.Backgrounds(), gain: 1, target: 1, changed: func() {}}
+
+	m.bg.Took(m)
+	m.bg.Stand(true) // a reply takes the speaker
+	m.bg.Gave(m)     // the track is stopped underneath it
+
+	m.flush()
+}

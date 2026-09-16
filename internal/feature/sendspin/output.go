@@ -350,20 +350,17 @@ func (o *out) setVolume(volume int) {
 
 func (o *out) setMuted(muted bool) { media.Get().Mute(muted) }
 
-// Suspend and Resume do not keep a place: the rest of the house carried on, so this rejoins where they
-// are now, which is what the frame index already says.
-func (o *out) Suspend() {
+// Stand does not keep a place: the rest of the house carried on, so rejoining picks up where they are
+// now, which is what the frame index already says.
+func (o *out) Stand(down bool) {
 	o.mu.Lock()
-	o.held = true
+	was := o.held
+	o.held = down
 	o.mu.Unlock()
-	slog.Info("sendspin suspend", "queued_ms", o.queuedMs())
-}
 
-func (o *out) Resume() {
-	o.mu.Lock()
-	o.held = false
-	o.mu.Unlock()
-	slog.Info("sendspin resume", "queued_ms", o.queuedMs())
+	if was != down {
+		slog.Info("sendspin standing", "down", down, "queued_ms", o.queuedMs())
+	}
 }
 
 // Duck always quietens, never pauses, whatever config.Media.OnTurn says: a hole in one room of a

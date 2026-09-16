@@ -46,12 +46,13 @@ func Sound() *Driver {
 // plays for minutes and cannot be started again from where it was. Everything else is an errand
 // that runs to the end, so a claim is enough for it.
 type Background interface {
-	// Suspend stops filling the queue and empties what is in it. It is called before the claim that
-	// displaced it queues anything, so the two never fight over the same audio.
-	Suspend()
-
-	// Resume carries on, if the caller is still what it was suspended for.
-	Resume()
+	// Stand says whether anything holds the speaker. Standing down stops filling the queue and puts
+	// aside what is in it, and it is said before the claim that displaced it queues anything, so the
+	// two never fight over the same audio.
+	//
+	// It is the state rather than a change to it, so saying the same thing twice does nothing and a
+	// missed word is corrected by the next one.
+	Stand(down bool)
 }
 
 // Yields registers the background sound. There is one.
@@ -120,11 +121,7 @@ func (d *Driver) settle() {
 	if bg == nil {
 		return
 	}
-	if want {
-		bg.Suspend()
-		return
-	}
-	bg.Resume()
+	bg.Stand(want)
 }
 
 // Interject makes a sound without taking the speaker from what has it. Short feedback — a volume

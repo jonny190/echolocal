@@ -61,11 +61,11 @@ func newMediaCmd() *cobra.Command {
 				go func() {
 					time.Sleep(duck)
 					fmt.Fprintf(out, "taking the speaker for %s\n", hold)
-					player.Suspend()
+					player.Stand(true)
 
 					time.Sleep(hold)
 					fmt.Fprintln(out, "giving it back")
-					player.Resume()
+					player.Stand(false)
 				}()
 			}
 
