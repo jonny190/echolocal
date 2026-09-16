@@ -116,6 +116,43 @@ func TestCommandResultRejectsMalformedEvent(t *testing.T) {
 	}
 }
 
+func TestReportsReadAddressInWrittenOrder(t *testing.T) {
+	// 7c:2f:80:1a:2b:3c, a resolvable private address, as an iPhone advertises Apple's nearby info.
+	data := []byte{0x02, 0x01, 0x1a, 0x0b, 0xff, 0x4c, 0x00, 0x10, 0x06, 0x41, 0x1e, 0xf4, 0x2c, 0x9a, 0xd8}
+	report := []byte{h4Event, evtLEMeta, 0, leAdvertisingReport, 1, 0x00, 0x01,
+		0x3c, 0x2b, 0x1a, 0x80, 0x2f, 0x7c, byte(len(data))}
+	report = append(report, data...)
+	report = append(report, 0xc4) // RSSI -60
+	report[2] = byte(len(report) - 3)
+
+	var got []Advertisement
+	r := &Radio{}
+	remainder, err := r.parse(report, func(a Advertisement) { got = append(got, a) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remainder) != 0 {
+		t.Errorf("remainder = %x, want empty", remainder)
+	}
+	if len(got) != 1 {
+		t.Fatalf("advertisements = %d, want 1", len(got))
+	}
+
+	a := got[0]
+	if a.Addr() != 0x7c2f801a2b3c {
+		t.Errorf("address = %012x, want 7c2f801a2b3c", a.Addr())
+	}
+	if a.AddressType != 0x01 {
+		t.Errorf("address type = %d, want 1", a.AddressType)
+	}
+	if a.RSSI != -60 {
+		t.Errorf("rssi = %d, want -60", a.RSSI)
+	}
+	if !slices.Equal(a.Data, data) {
+		t.Errorf("data = %x, want %x", a.Data, data)
+	}
+}
+
 func commandComplete(opcode uint16, status byte) []byte {
 	event := []byte{h4Event, evtCommandComplete, 4, 1, 0, 0, status}
 	binary.LittleEndian.PutUint16(event[4:], opcode)

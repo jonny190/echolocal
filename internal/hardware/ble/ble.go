@@ -289,7 +289,11 @@ func reports(p []byte, found func(Advertisement)) {
 		}
 
 		a := Advertisement{AddressType: p[at+1], RSSI: int8(p[end])}
-		copy(a.Address[:], p[at+2:at+8])
+		// HCI carries an address least significant octet first. Address is the MAC as it is written,
+		// which is the order a resolvable private address has to be in to be matched against an IRK.
+		for i := range a.Address {
+			a.Address[i] = p[at+7-i]
+		}
 		a.Data = append([]byte(nil), p[at+9:end]...)
 		found(a)
 
