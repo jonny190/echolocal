@@ -267,7 +267,6 @@ func (s *session) tell(want ...string) bool {
 	return false
 }
 
-
 // ended drops what is held: the spec has stream/end stop output and clear buffers, and the server sends
 // it on stop, skip and seek. A track running into the next one keeps the stream and says nothing.
 //
