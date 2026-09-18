@@ -14,7 +14,6 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/ygelfand/echolocal/internal/config"
-	"github.com/ygelfand/echolocal/internal/feature/media"
 	"github.com/ygelfand/echolocal/internal/hardware/speaker"
 	"github.com/ygelfand/echolocal/internal/layout"
 	"github.com/ygelfand/echolocal/internal/lib/safe"
@@ -196,7 +195,7 @@ func (s *session) began(start protocol.StreamStart) {
 	s.opened = true
 	if first {
 		s.bg.Took(s.out)
-		s.player.state.Set(statePlaying)
+		s.player.setState(statePlaying)
 	}
 	slog.Info("sendspin stream", "codec", p.Codec, "rate", p.SampleRate, "ch", p.Channels, "bits", p.BitDepth)
 }
@@ -281,8 +280,7 @@ func (s *session) ended() {
 	s.cleared()
 	s.out.close()
 	s.bg.Gave(s.out)
-	s.player.state.Set(stateJoined)
-	media.Get().Changed()
+	s.player.setState(stateJoined)
 }
 
 // heard plays a chunk as it arrives.

@@ -179,6 +179,12 @@ func (p *Player) holds(s *session) {
 	media.Get().External(p)
 }
 
+// setState publishes it and tells the media player, which reads Playing from it.
+func (p *Player) setState(state string) {
+	p.state.Set(state)
+	media.Get().Changed()
+}
+
 // grouped takes the group's playback state, which is what separates a pause from a track ending.
 func (p *Player) grouped(state string) {
 	p.mu.Lock()
