@@ -239,7 +239,10 @@ func (u *Firmware) Install(ctx context.Context) {
 	defer working.Done()
 
 	u.progress(found, 0)
-	err = update.Install(ctx, found, func(at float32) { u.progress(found, at) })
+	err = update.Install(ctx, found, func(at float32) {
+		working.Refresh()
+		u.progress(found, at)
+	})
 
 	// Home Assistant learns nothing from the command it sent — the update entity has no way to say an
 	// install failed, and the card just goes back to offering it. So the failure has to arrive as state,

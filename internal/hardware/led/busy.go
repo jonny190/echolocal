@@ -34,9 +34,9 @@ const (
 // that got it there, held still because nothing is running to animate it.
 var UpdateColor = Color{R: 0x00, G: 0xB0, B: 0xC0}
 
-// busyLimit is the longest any one piece of work may hold the ring. Whatever ends a busy indication is
-// a signal from elsewhere, and a signal that never arrives would otherwise animate the device for
-// ever.
+// busyLimit is the longest any one piece of work may hold the ring without progress. Whatever ends a
+// busy indication is a signal from elsewhere, and a signal that never arrives would otherwise animate
+// the device for ever.
 const busyLimit = time.Minute
 
 // appearance is the motion and colour for a kind of work. One motion for all of them on purpose: it
@@ -120,6 +120,20 @@ func (t *Task) Done() {
 	t.timer.Stop()
 	t.busy.tasks = slices.Delete(t.busy.tasks, i, i+1)
 	t.busy.show()
+}
+
+// Refresh puts the limit back to the beginning, for work that is still going.
+func (t *Task) Refresh() {
+	if t == nil {
+		return
+	}
+
+	t.busy.mu.Lock()
+	defer t.busy.mu.Unlock()
+
+	if slices.Contains(t.busy.tasks, t) {
+		t.timer.Reset(busyLimit)
+	}
 }
 
 // Running reports whether anything is working, for whoever wants to know without holding a task.

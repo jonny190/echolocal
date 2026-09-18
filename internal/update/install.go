@@ -90,7 +90,7 @@ func download(ctx context.Context, b Binary, to string, progress func(float32)) 
 		from: resp.Body, size: b.Size, report: progress,
 	})
 	if err != nil {
-		return fmt.Errorf("update: downloading %s: %w", b.URL, err)
+		return fmt.Errorf("update: downloading %s: %d of %d bytes: %w", b.URL, written, b.Size, err)
 	}
 	if err := f.Sync(); err != nil {
 		return err
