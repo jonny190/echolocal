@@ -60,9 +60,20 @@ type Player struct {
 	// playing: its mapper has no case for announcing and raises on it.
 	speaking atomic.Bool
 
-	external atomic.Bool
+	// external is whatever else is driving the speaker, and nil when nothing is.
+	external atomic.Pointer[Source]
 
 	step int
+}
+
+// Source is audio this player did not start: a group the room has joined, playing through the same
+// speaker. Home Assistant has one media player entity for the device either way, so the transport
+// controls have to reach whoever is actually playing.
+type Source interface {
+	Play()
+	Pause()
+	Stop()
+	Playing() (playing, paused bool)
 }
 
 var (
@@ -314,16 +325,16 @@ func (p *Player) command(c esphome.MediaCommand) {
 	case esphome.MediaPlayerUnmute:
 		p.Mute(false)
 	case esphome.MediaPlayerStop:
-		p.stream.Stop()
+		p.Stop()
 	case esphome.MediaPlayerPause:
-		p.stream.Pause()
+		p.Pause()
 	case esphome.MediaPlayerPlay:
-		p.stream.Unpause()
+		p.Unpause()
 	case esphome.MediaPlayerToggle:
-		if playing, _ := p.stream.Playing(); playing {
-			p.stream.Pause()
+		if playing, _ := p.Playing(); playing {
+			p.Pause()
 		} else {
-			p.stream.Unpause()
+			p.Unpause()
 		}
 	}
 }
@@ -361,18 +372,60 @@ func (p *Player) Sounding(on bool) {
 	p.refresh()
 }
 
-// External marks the speaker as busy with something this player did not start.
-func (p *Player) External(on bool) {
-	p.external.Store(on)
+// External hands the speaker to something this player did not start, and takes it back with nil.
+func (p *Player) External(s Source) {
+	if s == nil {
+		p.external.Store(nil)
+	} else {
+		p.external.Store(&s)
+	}
 	p.refresh()
 }
 
-// Playing reports what the track is doing, which is what decides whether a turn has anything to take
-// the speaker from.
-func (p *Player) Playing() (playing, paused bool) { return p.stream.Playing() }
+// Changed is how an external source says it is doing something different now.
+func (p *Player) Changed() { p.refresh() }
 
-// Pause leaves the track where it is, so it can be picked up again.
-func (p *Player) Pause() { p.stream.Pause() }
+func (p *Player) source() Source {
+	if s := p.external.Load(); s != nil {
+		return *s
+	}
+	return nil
+}
+
+// Playing reports what is playing, which is what decides whether a turn has anything to take the
+// speaker from and whether the stop word has anything to stop.
+func (p *Player) Playing() (playing, paused bool) {
+	playing, paused = p.stream.Playing()
+	if s := p.source(); s != nil {
+		ext, extPaused := s.Playing()
+		playing, paused = playing || ext, paused || extPaused
+	}
+	return playing, paused
+}
+
+// Pause leaves what is playing where it is, so it can be picked up again.
+func (p *Player) Pause() {
+	p.stream.Pause()
+	if s := p.source(); s != nil {
+		s.Pause()
+	}
+}
+
+// Unpause picks up whatever Pause left.
+func (p *Player) Unpause() {
+	p.stream.Unpause()
+	if s := p.source(); s != nil {
+		s.Play()
+	}
+}
+
+// Stop ends what is playing. There is nothing to come back to afterwards.
+func (p *Player) Stop() {
+	p.stream.Stop()
+	if s := p.source(); s != nil {
+		s.Stop()
+	}
+}
 
 // refresh tells Home Assistant what the player is doing. Anything that displaces the noise — a track,
 // a stop, the action button — clears both entities, rather than leaving them naming a sound nobody can
@@ -388,10 +441,10 @@ func (p *Player) refresh() {
 }
 
 func (p *Player) state() esphome.MediaPlayerState {
-	playing, paused := p.stream.Playing()
+	playing, paused := p.Playing()
 
 	switch {
-	case playing || p.speaking.Load() || p.external.Load():
+	case playing || p.speaking.Load():
 		return esphome.MediaPlayerPlaying
 	case paused:
 		return esphome.MediaPlayerPaused

@@ -5,11 +5,13 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/Sendspin/sendspin-go/pkg/protocol"
 	esphome "github.com/ygelfand/go-esphome-device"
 
 	"github.com/ygelfand/echolocal/internal/android/firewall"
 	"github.com/ygelfand/echolocal/internal/component"
 	"github.com/ygelfand/echolocal/internal/config"
+	"github.com/ygelfand/echolocal/internal/feature/media"
 	"github.com/ygelfand/echolocal/internal/hardware/speaker"
 	"github.com/ygelfand/echolocal/internal/lib/safe"
 )
@@ -23,13 +25,31 @@ func init() {
 type Player struct {
 	enabled *esphome.Switch
 	state   *esphome.TextSensor
+	title   *esphome.TextSensor
+	artist  *esphome.TextSensor
 
 	out *out
 
 	mu      sync.Mutex
 	running context.CancelFunc
 	wake    chan struct{}
+
+	// joined is the server holding the room, set while one is connected. Home Assistant's transport
+	// controls go to it, and there is nothing to send them to when it is nil.
+	joined *session
+
+	// playing is the group's own playback state, which is the only thing that tells a pause from a
+	// track that ended: both leave this room silent.
+	playing track
+	paused  bool
+
+	// artwork is the newest image the server sent. Nothing here can draw it yet.
+	artwork []byte
 }
+
+// artworkSize is what the server is asked to scale album art to. A placeholder until there is a
+// screen to size it to.
+const artworkSize = 512
 
 var (
 	once   sync.Once
@@ -74,6 +94,23 @@ func build() *Player {
 		},
 	}
 	p.state.Set(stateOff)
+
+	p.title = &esphome.TextSensor{
+		Base: esphome.Base{
+			ObjectID: "sendspin_title",
+			Name:     "Now playing",
+			Icon:     "mdi:music-note",
+			DeviceID: component.DevicePlayback,
+		},
+	}
+	p.artist = &esphome.TextSensor{
+		Base: esphome.Base{
+			ObjectID: "sendspin_artist",
+			Name:     "Artist",
+			Icon:     "mdi:account-music",
+			DeviceID: component.DevicePlayback,
+		},
+	}
 	return p
 }
 
@@ -88,7 +125,102 @@ const (
 func (p *Player) Name() string { return "sendspin" }
 
 func (p *Player) Entities() []esphome.Entity {
-	return []esphome.Entity{p.enabled, p.state}
+	return []esphome.Entity{p.enabled, p.state, p.title, p.artist}
+}
+
+// Play, Pause and Stop implement media.Source: Home Assistant reaches for the speaker entity whoever
+// started the audio, so when a group is playing these are what its buttons mean.
+//
+// Stop falls back to pause because a room that joined a group cannot end what the group is playing;
+// leaving the group would silence this room and keep the rest going, which is not what stop means.
+func (p *Player) Play()  { p.tell("play") }
+func (p *Player) Pause() { p.tell("pause") }
+func (p *Player) Stop()  { p.tell("stop", "pause") }
+
+func (p *Player) tell(want ...string) {
+	p.mu.Lock()
+	s := p.joined
+	p.mu.Unlock()
+
+	if s == nil {
+		return
+	}
+
+	// Off the caller's thread: this arrives on Home Assistant's read loop, and the send holds a lock
+	// around a websocket write with no deadline on it. A server that stopped reading would take the
+	// device's own connection down with it.
+	safe.Go("sendspin command", func() { s.tell(want...) })
+}
+
+// Playing implements media.Source.
+func (p *Player) Playing() (playing, paused bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.state.Get() == statePlaying && !p.paused, p.paused
+}
+
+// holds says which session owns the room, and nil when none does. The media player follows it: the
+// group answers Home Assistant's transport controls for as long as it is connected, whether or not
+// audio happens to be arriving this second.
+func (p *Player) holds(s *session) {
+	p.mu.Lock()
+	p.joined = s
+	p.paused = false
+	p.playing = track{}
+	p.mu.Unlock()
+
+	p.title.Set("")
+	p.artist.Set("")
+
+	if s == nil {
+		media.Get().External(nil)
+		return
+	}
+	media.Get().External(p)
+}
+
+// grouped takes the group's playback state, which is what separates a pause from a track ending.
+func (p *Player) grouped(state string) {
+	p.mu.Lock()
+	p.paused = state == "paused"
+	p.mu.Unlock()
+	media.Get().Changed()
+}
+
+// track is what the room is playing, as far as the metadata role has said.
+func (p *Player) track() track {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.playing
+}
+
+// plays publishes the track. The empty one clears the sensors rather than leaving them naming
+// something nobody can hear.
+func (p *Player) plays(t track) {
+	p.mu.Lock()
+	p.playing = t
+	p.mu.Unlock()
+
+	p.title.Set(t.Title)
+	p.artist.Set(t.Artist)
+	if !t.empty() {
+		slog.Info("sendspin now playing", "title", t.Title, "artist", t.Artist, "album", t.Album)
+	}
+}
+
+// drew keeps the newest album art. There is no screen on this device, so this is where it stops.
+func (p *Player) drew(art protocol.ArtworkChunk) {
+	p.mu.Lock()
+	p.artwork = art.Data
+	p.mu.Unlock()
+	slog.Debug("sendspin artwork", "channel", art.Channel, "bytes", len(art.Data))
+}
+
+// Artwork is the newest album art the server sent, and nil when there is none.
+func (p *Player) Artwork() []byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.artwork
 }
 
 // Restore puts the switch back where it was left. Listening waits for Run, once there is a network.
@@ -145,7 +277,7 @@ func (p *Player) settle(parent context.Context) {
 	}
 
 	name := config.Get().Device.Name
-	l := newListener(p.out, speaker.Sound().Backgrounds(), p.state.Set)
+	l := newListener(p.out, speaker.Sound().Backgrounds(), p)
 
 	safe.Go("sendspin listen", func() {
 		if err := l.serve(ctx, name); err != nil {

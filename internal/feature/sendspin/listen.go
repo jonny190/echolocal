@@ -23,16 +23,16 @@ type listener struct {
 	out *out
 	bg  *speaker.Arbiter
 
-	// report says what the room is doing, for the diagnostic sensor. Called from the accept goroutine
-	// and from the session, so whatever it writes to has to tolerate that.
-	report func(string)
+	// player is what the room shows Home Assistant. Written to from the accept goroutine and from the
+	// session, so it has to tolerate that.
+	player *Player
 
 	mu   sync.Mutex
 	busy bool
 }
 
-func newListener(o *out, bg *speaker.Arbiter, report func(string)) *listener {
-	return &listener{out: o, bg: bg, report: report}
+func newListener(o *out, bg *speaker.Arbiter, p *Player) *listener {
+	return &listener{out: o, bg: bg, player: p}
 }
 
 // serve holds the port until ctx ends.
@@ -64,10 +64,15 @@ func (l *listener) serve(ctx context.Context, name string) error {
 		defer conn.Close()
 
 		slog.Info("sendspin server connected", "from", r.RemoteAddr)
-		l.report(stateJoined)
-		defer l.report(stateWaiting)
+		l.player.state.Set(stateJoined)
+		defer l.player.state.Set(stateWaiting)
 
-		s := newSession(conn, l.out, l.bg, name, l.report)
+		// For as long as the server is connected, not just while audio is arriving: a paused group is
+		// one this room can still be told to play again.
+		s := newSession(conn, l.out, l.bg, name, l.player)
+		l.player.holds(s)
+		defer l.player.holds(nil)
+
 		if err := s.run(ctx); err != nil {
 			slog.Warn("sendspin session ended", "from", r.RemoteAddr, "err", err)
 		} else {

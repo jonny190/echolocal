@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"log/slog"
 	"math"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/Sendspin/sendspin-go/pkg/protocol"
@@ -36,7 +38,7 @@ type session struct {
 	clock  *ssync.ClockSync
 	out    *out
 	bg     *speaker.Arbiter
-	report func(string)
+	player *Player
 
 	// dec is non-nil exactly while a stream is running.
 	dec    decoder
@@ -46,9 +48,16 @@ type session struct {
 	lastTS int64
 	opened bool
 	muted  bool
+
+	// mu guards commands, which the run loop writes and Home Assistant reads when it presses stop.
+	mu sync.Mutex
+
+	// commands is what the server said it would act on, from the controller role. Sending anything
+	// else is a message the server is free to ignore, so what is not in here is not sent.
+	commands []string
 }
 
-func newSession(conn *websocket.Conn, o *out, bg *speaker.Arbiter, name string, report func(string)) *session {
+func newSession(conn *websocket.Conn, o *out, bg *speaker.Arbiter, name string, p *Player) *session {
 	offered := make([]protocol.AudioFormat, 0, len(formats()))
 	for _, f := range formats() {
 		offered = append(offered, protocol.AudioFormat{
@@ -62,8 +71,7 @@ func newSession(conn *websocket.Conn, o *out, bg *speaker.Arbiter, name string, 
 
 		Version: protocolVersion,
 
-		// Nothing is activated that is not claimed here.
-		SupportedRoles: []string{"player@v1"},
+		SupportedRoles: []string{"player@v1", "metadata@v1", "controller@v1", "artwork@v1"},
 
 		// The factory mac: survives a reinstall, a rename and a new address.
 		ClientID: mac,
@@ -77,9 +85,17 @@ func newSession(conn *websocket.Conn, o *out, bg *speaker.Arbiter, name string, 
 			BufferCapacity:    bufferCapacity,
 			SupportedCommands: []string{"volume", "mute"},
 		},
+		ArtworkV1Support: &protocol.ArtworkV1Support{
+			Channels: []protocol.ArtworkChannel{{
+				Source:      "album",
+				Format:      "jpeg",
+				MediaWidth:  artworkSize,
+				MediaHeight: artworkSize,
+			}},
+		},
 	}, conn)
 
-	return &session{client: client, clock: ssync.NewClockSync(), out: o, bg: bg, report: report}
+	return &session{client: client, clock: ssync.NewClockSync(), out: o, bg: bg, player: p}
 }
 
 // bufferCapacity caps how far ahead the server may send, which is the stall the room can ride out. The
@@ -138,10 +154,11 @@ func (s *session) run(ctx context.Context) error {
 		case g := <-s.client.GroupUpdate:
 			s.grouped(g)
 
-		// Nothing acts on these, but an undrained channel blocks the reader.
 		case st := <-s.client.ServerState:
-			slog.Info("sendspin server state", "state", st)
-		case <-s.client.ArtworkChunks:
+			s.said(st)
+
+		case art := <-s.client.ArtworkChunks:
+			s.player.drew(art)
 		}
 	}
 }
@@ -179,8 +196,7 @@ func (s *session) began(start protocol.StreamStart) {
 	s.opened = true
 	if first {
 		s.bg.Took(s.out)
-		s.report(statePlaying)
-		media.Get().External(true)
+		s.player.state.Set(statePlaying)
 	}
 	slog.Info("sendspin stream", "codec", p.Codec, "rate", p.SampleRate, "ch", p.Channels, "bits", p.BitDepth)
 }
@@ -200,17 +216,63 @@ func (s *session) cleared() {
 	}
 }
 
-// grouped only reports. Stopping is stream/end's job, which the server sends on stop as well as on skip
-// and seek. Fields are deltas, so an absent state means unchanged.
+// grouped records what the group is doing. Stopping is stream/end's job, which the server sends on stop
+// as well as on skip and seek. Fields are deltas, so an absent state means unchanged.
 func (s *session) grouped(g protocol.GroupUpdate) {
 	if g.PlaybackState == nil {
 		return
 	}
 	slog.Info("sendspin group", "state", *g.PlaybackState, "queued_ms", s.out.queuedMs())
+	s.player.grouped(*g.PlaybackState)
 }
+
+// said takes what the server reports about itself: the track for the metadata role, and for the
+// controller role the commands it will act on.
+func (s *session) said(st protocol.ServerStateMessage) {
+	if c := st.Controller; c != nil {
+		s.mu.Lock()
+		s.commands = c.SupportedCommands
+		s.mu.Unlock()
+		slog.Info("sendspin server commands", "commands", c.SupportedCommands)
+	}
+
+	if m := st.Metadata; m != nil {
+		s.player.plays(s.player.track().merge(m))
+	}
+}
+
+// tell asks the server to do something. Only what it advertised is sent: the rest it is free to
+// ignore, and a command that was never going to land should say so here rather than look like it
+// worked.
+func (s *session) tell(want ...string) bool {
+	s.mu.Lock()
+	can := s.commands
+	s.mu.Unlock()
+
+	for _, cmd := range want {
+		if !slices.Contains(can, cmd) {
+			continue
+		}
+		if err := s.client.Send("client/command", map[string]any{
+			"controller": map[string]string{"command": cmd},
+		}); err != nil {
+			slog.Error("sendspin command", "command", cmd, "err", err)
+			return false
+		}
+		slog.Info("sendspin command", "command", cmd)
+		return true
+	}
+
+	slog.Warn("sendspin will not take this", "wanted", want, "server takes", can)
+	return false
+}
+
 
 // ended drops what is held: the spec has stream/end stop output and clear buffers, and the server sends
 // it on stop, skip and seek. A track running into the next one keeps the stream and says nothing.
+//
+// The room stays the group's for all that. A pause is a stream that ended, and a group that is still
+// there to be told to play again.
 func (s *session) ended() {
 	if s.dec == nil {
 		return
@@ -220,8 +282,8 @@ func (s *session) ended() {
 	s.cleared()
 	s.out.close()
 	s.bg.Gave(s.out)
-	s.report(stateJoined)
-	media.Get().External(false)
+	s.player.state.Set(stateJoined)
+	media.Get().Changed()
 }
 
 // heard plays a chunk as it arrives.
