@@ -58,11 +58,21 @@ Points worth knowing before touching it:
   new device to every server.
 - `session_test.go` contains a small Sendspin server used to drive the room end to end.
 
+## Clock and logging
+
+`internal/feature/clock` sets the time from the NTP server in dhcpcd's lease (option 42, which the
+installer makes dhcpcd request), then `ntp.servers` in echod.yaml, then public pools, slewing small
+offsets and writing the RTC. Amazon's sntpd and securetime are disabled. `docs/time-sync.md` has the
+design, `guides/setting-the-clock.md` the user notes. A boot step in `internal/android/setup` also
+holds Amazon's chatty daemons to warnings via `log.tag.<tag>` properties and grows the logd buffer to
+1 MB; the quiet list is `vendorTags` there.
+
 ## Upstream
 
 Upstream is ygelfand/echolocal, remote `upstream`. The drift correction in `output.go` was accepted
-there (PR 35). The encryption work is PR 34, kept on branch `sendspin-encryption-upstream`, which is
-this fork's main minus this file. When upstream main moves, sync the fork's main to it, rebase the
+there (PR 35). The encryption work is PR 34, kept on branch `sendspin-encryption-upstream`. The log
+tidy-up is PR 72 (branch `quiet-logs`) and the clock is PR 73 (branch `clock`); both are single
+commits on upstream main that were then cherry-picked onto this fork's main. When upstream main moves, sync the fork's main to it, rebase the
 encryption commit, and force-push that branch.
 
 ## Conventions
