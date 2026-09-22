@@ -204,6 +204,12 @@ func (c *Clock) candidates() []source {
 func (c *Clock) apply(r sntp.Result, s source) error {
 	how := "kept"
 	off := r.Offset
+
+	// right is what the clock should read. After a step the system clock already says so; after a
+	// slew or nothing it is still the offset away, and the RTC is written with the corrected time
+	// either way.
+	right := func() time.Time { return time.Now().Add(off) }
+
 	switch {
 	case off > -deadband && off < deadband:
 	case off > -maxSlew && off < maxSlew:
@@ -212,16 +218,17 @@ func (c *Clock) apply(r sntp.Result, s source) error {
 		}
 		how = "slewed"
 	default:
-		if err := step(time.Now().Add(off)); err != nil {
+		if err := step(right()); err != nil {
 			return err
 		}
 		how = "stepped"
+		right = time.Now
 		slog.Warn("clock stepped", "by", off, "server", r.Server, "via", s.via)
 	}
 
 	// The RTC is written after every answer, not only a correction: it is what the next boot starts
 	// from, and a boot that starts within a slew of right never has to step.
-	if err := writeRTC(time.Now().Add(off)); err != nil {
+	if err := writeRTC(right()); err != nil {
 		slog.Debug("clock rtc", "err", err)
 	}
 
