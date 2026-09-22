@@ -72,6 +72,26 @@ var Actions = []Action{
 		Do: func() error { return prop.Set("log.tag.AmazonUsageStatsService", "S") },
 	},
 	{
+		Name: "quieten Amazon's daemons",
+		Reason: "they fill the 256 KB log buffer in under half an hour, pushing out anything echod " +
+			"said before it",
+		// Measured on a Fire OS 6 device left alone: two thirds of the log was wifisvc's websocket
+		// library narrating itself at info, the secure clock failing the same TEE call every few
+		// seconds, the key-value store reading a table that does not exist, and the power service
+		// dumping wakelock statistics once a minute. None of it is about anything echod can act on.
+		// liblog consults log.tag.<tag> before writing, so the chatter is stopped at the source: the
+		// info-level narrators are held to warnings, and the ones whose only output is one repeating
+		// error are silenced. Set every boot, like the AmazonUsageStatsService one above.
+		Do: quietenVendorTags,
+	},
+	{
+		Name:   "keep more of the log",
+		Reason: "256 KB of main buffer is half an hour on this device; a megabyte is what a report needs",
+		// logd reads persist.logd.size when it starts, so this takes effect from the next boot. The
+		// device has 480 MB and a megabyte of log is nothing to it.
+		Do: func() error { return prop.Set("persist.logd.size", "1M") },
+	},
+	{
 		Name:   "size the runtime to the cores that are present",
 		Reason: "the kernel hotplugs them, so Go sees however many were online when it started",
 		// GOMAXPROCS is read once at start-up. Pinning cores against the governor is the answer we
@@ -90,6 +110,37 @@ var Actions = []Action{
 		// carrying /etc/ssl/certs/ca-certificates.crt keeps every root it already had.
 		Do: func() error { return os.Setenv("SSL_CERT_DIR", certDirs) },
 	},
+}
+
+// vendorTags is what each of Amazon's noisy log tags is held to. W keeps warnings and errors; S is
+// silent, for daemons whose every line is the same failure repeating.
+var vendorTags = map[string]string{
+	// wifisvc: libwebsockets tracing every poll, connect and free at info.
+	"ACE_CONN_MGR": "W",
+	"ACE-AIPC":     "W",
+	"ace_wifi":     "W",
+	"ace_net_mgr":  "W",
+	// Wakelock statistics, dumped whole once a minute.
+	"PWRSVC": "W",
+	// The wifi firmware loader's start-up narration.
+	"wmt_launcher": "W",
+	// securetime asking a TEE that is not there, every few seconds, forever.
+	"TEESecureClock": "S",
+	"uree.so":        "S",
+	// The key-value store reading a legacy table that does not exist on this firmware.
+	"acehalkvs": "S",
+	// The region daemon failing to reach Amazon, which it never will from here.
+	"halo_regiond": "S",
+}
+
+func quietenVendorTags() error {
+	var first error
+	for tag, level := range vendorTags {
+		if err := prop.Set("log.tag."+tag, level); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 // certDirs are the directories a GOOS=android build would have scanned: the platform's roots, and any
