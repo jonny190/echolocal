@@ -87,9 +87,17 @@ var Actions = []Action{
 	{
 		Name:   "keep more of the log",
 		Reason: "256 KB of main buffer is half an hour on this device; a megabyte is what a report needs",
-		// logd reads persist.logd.size when it starts, so this takes effect from the next boot. The
-		// device has 480 MB and a megabyte of log is nothing to it.
-		Do: func() error { return prop.Set("persist.logd.size", "1M") },
+		// logd reads persist.logd.size only when it starts, which is before the persistent properties
+		// are loaded, so setting it alone would never take. init's logd-reinit service exists for
+		// exactly this: it has logd read its properties again, keeping what is already in the buffers.
+		// Measured on device, the main buffer goes from 256 KB to 1 MB the moment it runs. The device
+		// has 480 MB and a megabyte of log is nothing to it.
+		Do: func() error {
+			if err := prop.Set("persist.logd.size", "1M"); err != nil {
+				return err
+			}
+			return prop.Start("logd-reinit")
+		},
 	},
 	{
 		Name:   "size the runtime to the cores that are present",
